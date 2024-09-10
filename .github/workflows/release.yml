@@ -26,7 +26,7 @@ jobs:
       - name: Build
         run: go build -o masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }} .
       - name: Upload
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}
           path: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}
