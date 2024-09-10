@@ -18,6 +18,9 @@ jobs:
       matrix:
         goos: [linux, darwin, windows, freebsd]
         goarch: [amd64, 386, arm64, arm]
+        exclude:
+          - goos: darwin
+            goarch: 386
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v2
