@@ -21,6 +21,8 @@ jobs:
         exclude:
           - goos: darwin
             goarch: 386
+          - goos: darwin
+            goarch: arm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v2
@@ -30,13 +32,21 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -o masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+        run: go build
+      - name: Archive Zip
+        if: matrix.goos == 'windows'
+        run: |
+          7z a -tzip masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}.zip masterclass-dl.exe
+      - name: Archive Tar
+        if: matrix.goos != 'windows'
+        run: |
+          tar -czf masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz masterclass-dl
       - name: Upload to Release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
-          asset_name: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          asset_path: ./masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
+          asset_name: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
           asset_content_type: application/octet-stream
