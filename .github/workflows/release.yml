@@ -1,0 +1,32 @@
+# workflow name
+name: Generate release-artifacts
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: read
+  packages: write
+
+# workflow tasks
+jobs:
+  release-matrix:
+    name: Release Go binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows, freebsd]
+        goarch: [amd64, 386, arm64, arm]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+        with:
+          go-version: 1.23.1
+      - name: Build
+        run: go build -o masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }} .
+      - name: Upload
+        uses: actions/upload-artifact@v2
+        with:
+          name: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: masterclass-dl-${{ matrix.goos }}-${{ matrix.goarch }}
