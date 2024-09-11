@@ -445,6 +445,7 @@ func downloadChapter(client *http.Client, datDir string, outputDir string, ytdlE
 	}
 
 	cmd := exec.Command(ytdlExec, "--embed-subs", "--all-subs", "-f", "bestvideo+bestaudio", chapterMetadata.Sources[0].Src, "-o", path.Join(outputDir, fmt.Sprintf("%03d-%s.mp4", chapter.Number, chapter.Title)))
+	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
 		return err
