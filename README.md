@@ -5,6 +5,7 @@ A command line tool to download masterclass.com classes.
 # Prerequisites
 
 - youtube-dl or yt-dlp
+- ffmpeg
 
 # Installation
 
