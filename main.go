@@ -62,7 +62,7 @@ func main() {
 	}
 	downloadCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory")
 	downloadCmd.Flags().BoolVarP(&downloadPdfs, "pdfs", "p", true, "Download PDFs")
-	downloadCmd.Flags().StringVarP(&ytdlExec, "ytdl-exec", "y", "youtube-dl", "Path to the youtube-dl or yt-dlp executable")
+	downloadCmd.Flags().StringVarP(&ytdlExec, "ytdl-exec", "y", "yt-dlp", "Path to the youtube-dl or yt-dlp executable")
 	downloadCmd.MarkFlagRequired("output")
 
 	var loginCmd = &cobra.Command{
