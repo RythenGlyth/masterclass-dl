@@ -10,6 +10,7 @@ A command line tool to download masterclass.com classes.
 - **Subtitles-only mode** - Download just subtitles without video files
 - **PDF workbooks** - Class guides and supplementary materials
 - **Flexible options** - Control what gets downloaded with `--pdfs`, `--posters`, `--limit`
+- **SSO support** - Login via Safari session for Google/Apple/company SSO accounts (macOS)
 
 ## Prerequisites
 
@@ -36,6 +37,23 @@ masterclass-dl login <email> <password>
 ```
 
 You'll be prompted to select a profile if your account has multiple profiles.
+
+### SSO Login (macOS only)
+
+If you sign in to MasterClass via **Google, Apple, or company SSO** (and don't have a password), use `safari-login` instead. It reads your session cookies directly from Safari — no password needed.
+
+**Requirements:**
+- macOS only
+- Must already be logged in to [masterclass.com](https://www.masterclass.com) in Safari
+- Terminal may need **Full Disk Access** in System Settings → Privacy & Security → Full Disk Access
+
+```bash
+masterclass-dl safari-login
+```
+
+You'll be prompted to select a profile if your account has multiple profiles.
+
+> **Note:** On Windows and Linux, use `masterclass-dl login <email> <password>` instead.
 
 ### Check Status
 
@@ -157,11 +175,12 @@ downloads/
 masterclass-dl [command]
 
 Available Commands:
-  completion  Generate the autocompletion script for the specified shell
-  download    Download a class, chapter, or category from masterclass.com
-  help        Help about any command
-  login       Login to masterclass.com
-  status      Check login status
+  completion    Generate the autocompletion script for the specified shell
+  download      Download a class, chapter, or category from masterclass.com
+  help          Help about any command
+  login         Login to masterclass.com
+  safari-login  Login using Safari session cookies (macOS only, for SSO users)
+  status        Check login status
 
 Use "masterclass-dl [command] --help" for more information about a command.
 ```

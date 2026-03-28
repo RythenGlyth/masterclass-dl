@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -63,21 +65,20 @@ func main() {
 	}
 	rootCmd.PersistentFlags().StringVarP(&datDir, "datDir", "d", "", "Path to the directory where cookies and other data will be stored (default: $HOME/.masterclass/)")
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug output")
-	if datDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if datDir == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			datDir = path.Join(home, ".masterclass")
 		}
-		datDir = path.Join(home, ".masterclass")
-	}
-
-	if _, err := os.Stat(datDir); os.IsNotExist(err) {
-		err := os.MkdirAll(datDir, 0755)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+		if _, err := os.Stat(datDir); os.IsNotExist(err) {
+			if err := os.MkdirAll(datDir, 0755); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 
 	var outputDir string
@@ -219,10 +220,36 @@ Password is resolved in this order:
 	}
 	metadataCmd.Flags().BoolVar(&jsonOutput, "json", true, "Output as JSON")
 
+	var safariLoginCmd = &cobra.Command{
+		Use:   "safari-login",
+		Short: "Login using your existing MasterClass session from Safari (macOS only)",
+		Long: `Reads your MasterClass session cookies directly from Safari and writes them
+to the masterclass-dl cookie store. Use this instead of 'login' if you
+authenticate via SSO (Google, Apple, company SSO) and cannot set a password.
+
+Requirements:
+  - macOS only
+  - Must be logged in to masterclass.com in Safari
+  - Terminal may need Full Disk Access in System Settings → Privacy & Security`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if runtime.GOOS != "darwin" {
+				fmt.Println("safari-login is only supported on macOS")
+				os.Exit(1)
+			}
+			err := safariLogin(getClient(datDir), datDir)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			fmt.Println("Login successful")
+		},
+	}
+
 	rootCmd.AddCommand(downloadCmd)
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(loginStatusCmd)
 	rootCmd.AddCommand(metadataCmd)
+	rootCmd.AddCommand(safariLoginCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -1754,12 +1781,7 @@ func downloadChapterVideo(cycleclient cycletls.CycleTLS, client *http.Client, pr
 	return true, nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+
 
 func downloadImage(client *http.Client, imageURL string, outputPath string) error {
 	resp, err := client.Get(imageURL)
@@ -2105,4 +2127,266 @@ func writeEpisodeNFO(chapter Chapter, course CourseResponse, outputDir string, n
 	xmlContent := []byte(xml.Header + string(output) + "\n")
 
 	return os.WriteFile(nfoPath, xmlContent, 0644)
+}
+
+// ---------------------------------------------------------------------------
+// Safari SSO login (macOS only)
+// ---------------------------------------------------------------------------
+
+// macEpochOffset is the number of seconds between 2001-01-01 and 1970-01-01.
+// Safari stores cookie expiry as Mac absolute time (seconds since 2001-01-01).
+const macEpochOffset = 978307200
+
+type safariCookieEntry struct {
+	Domain   string
+	Name     string
+	Value    string
+	Path     string
+	Expires  time.Time
+	Secure   bool
+	HttpOnly bool
+}
+
+// safariLogin reads MasterClass cookies from Safari's binary cookie store,
+// injects them into the masterclass-dl cookie jar, then fetches the profiles
+// API and writes profile.json — equivalent to a normal email/password login.
+func safariLogin(client *http.Client, datDir string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine home directory: %v", err)
+	}
+
+	cookieDB := path.Join(home,
+		"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
+
+	if _, err := os.Stat(cookieDB); os.IsNotExist(err) {
+		return fmt.Errorf("Safari cookie database not found at:\n  %s\n\nMake sure you are logged in to masterclass.com in Safari", cookieDB)
+	}
+
+	fmt.Println("Reading Safari cookies...")
+	allCookies, err := parseSafariBinaryCookies(cookieDB)
+	if err != nil {
+		return fmt.Errorf("failed to read Safari cookies: %v\n\n"+
+			"You may need to grant Terminal Full Disk Access in:\n"+
+			"  System Settings → Privacy & Security → Full Disk Access", err)
+	}
+
+	// Filter to masterclass.com cookies only
+	var mcCookies []*http.Cookie
+	for _, c := range allCookies {
+		if strings.HasSuffix(c.Domain, "masterclass.com") {
+			mcCookies = append(mcCookies, &http.Cookie{
+				Name:     c.Name,
+				Value:    c.Value,
+				Path:     c.Path,
+				Domain:   c.Domain,
+				Expires:  c.Expires,
+				Secure:   c.Secure,
+				HttpOnly: c.HttpOnly,
+			})
+		}
+	}
+
+	if len(mcCookies) == 0 {
+		return fmt.Errorf("no MasterClass cookies found in Safari.\nPlease log in to masterclass.com in Safari first")
+	}
+
+	// Verify the session cookie is present
+	hasSession := false
+	for _, c := range mcCookies {
+		if c.Name == "_mc_session" {
+			hasSession = true
+			break
+		}
+	}
+	if !hasSession {
+		return fmt.Errorf("_mc_session cookie not found in Safari.\nPlease make sure you are fully logged in to masterclass.com in Safari")
+	}
+
+	fmt.Printf("Found %d MasterClass cookies (including _mc_session)\n", len(mcCookies))
+
+	// Inject cookies into the jar for all relevant URLs
+	for _, rawURL := range []string{
+		"https://www.masterclass.com",
+		"https://masterclass.com",
+		"https://edge.masterclass.com",
+	} {
+		u, _ := url.Parse(rawURL)
+		client.Jar.SetCookies(u, mcCookies)
+	}
+
+	fmt.Println("Fetching profiles...")
+
+	req, err := http.NewRequest("GET", "https://www.masterclass.com/jsonapi/v1/profiles?deep=true", nil)
+	if err != nil {
+		return fmt.Errorf("failed to create profiles request: %v", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", "https://www.masterclass.com/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch profiles: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("profiles API returned %d: %s\n\n"+
+			"Your session may have expired — reload masterclass.com in Safari and try again",
+			resp.StatusCode, string(body))
+	}
+
+	var profiles []ProfileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&profiles); err != nil {
+		return fmt.Errorf("failed to parse profiles response: %v", err)
+	}
+	if len(profiles) == 0 {
+		return fmt.Errorf("no profiles found on your account")
+	}
+
+	// Let user pick profile if multiple, otherwise use the first
+	var selected ProfileResponse
+	if len(profiles) == 1 {
+		selected = profiles[0]
+	} else {
+		prompt := promptui.Select{
+			Label: "Select Profile",
+			Items: profiles,
+			Templates: &promptui.SelectTemplates{
+				Label:    "{{ .DisplayName }}",
+				Active:   "\U0001F449 {{ .DisplayName }}",
+				Inactive: "  {{ .DisplayName }}",
+				Selected: "\U0001F64C {{ .DisplayName }}",
+			},
+		}
+		i, _, err := prompt.Run()
+		if err != nil {
+			return err
+		}
+		selected = profiles[i]
+	}
+
+	fmt.Printf("Selected profile: %s\n", selected.DisplayName)
+
+	profileFile, err := os.Create(path.Join(datDir, "profile.json"))
+	if err != nil {
+		return fmt.Errorf("cannot create profile.json: %v", err)
+	}
+	defer profileFile.Close()
+	if err := json.NewEncoder(profileFile).Encode(selected); err != nil {
+		return fmt.Errorf("cannot write profile.json: %v", err)
+	}
+
+	return nil
+}
+
+// parseSafariBinaryCookies parses the binary cookies file format used by Safari.
+func parseSafariBinaryCookies(filepath string) ([]safariCookieEntry, error) {
+	data, err := os.ReadFile(filepath)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < 8 || string(data[:4]) != "cook" {
+		return nil, fmt.Errorf("not a valid Safari binary cookies file")
+	}
+
+	numPages := int(binary.BigEndian.Uint32(data[4:8]))
+	pageOffsets := make([]int, numPages)
+	pageSizes := make([]int, numPages)
+	headerOffset := 8
+	for i := 0; i < numPages; i++ {
+		if headerOffset+4 > len(data) {
+			break
+		}
+		pageSizes[i] = int(binary.BigEndian.Uint32(data[headerOffset : headerOffset+4]))
+		headerOffset += 4
+	}
+
+	cursor := headerOffset
+	for i := 0; i < numPages; i++ {
+		pageOffsets[i] = cursor
+		cursor += pageSizes[i]
+	}
+
+	var cookies []safariCookieEntry
+	for i, pageSize := range pageSizes {
+		if pageOffsets[i]+pageSize > len(data) {
+			break
+		}
+		page := data[pageOffsets[i] : pageOffsets[i]+pageSize]
+		if len(page) < 8 {
+			continue
+		}
+		numCookies := int(binary.LittleEndian.Uint32(page[4:8]))
+		for j := 0; j < numCookies; j++ {
+			start := 8 + j*4
+			if start+4 > len(page) {
+				break
+			}
+			co := int(binary.LittleEndian.Uint32(page[start : start+4]))
+			c, err := parseSafariCookie(page, co)
+			if err != nil {
+				continue
+			}
+			cookies = append(cookies, c)
+		}
+	}
+	return cookies, nil
+}
+
+func parseSafariCookie(page []byte, offset int) (safariCookieEntry, error) {
+	if offset+56 > len(page) {
+		return safariCookieEntry{}, fmt.Errorf("offset out of bounds")
+	}
+	flags := binary.LittleEndian.Uint32(page[offset+8 : offset+12])
+	urlOff := int(binary.LittleEndian.Uint32(page[offset+16 : offset+20]))
+	nameOff := int(binary.LittleEndian.Uint32(page[offset+20 : offset+24]))
+	pathOff := int(binary.LittleEndian.Uint32(page[offset+24 : offset+28]))
+	valueOff := int(binary.LittleEndian.Uint32(page[offset+28 : offset+32]))
+	expiryBits := binary.LittleEndian.Uint64(page[offset+40 : offset+48])
+
+	readStr := func(base int) (string, error) {
+		abs := offset + base
+		if abs >= len(page) {
+			return "", fmt.Errorf("string offset out of bounds")
+		}
+		end := abs
+		for end < len(page) && page[end] != 0 {
+			end++
+		}
+		return string(page[abs:end]), nil
+	}
+
+	domain, err := readStr(urlOff)
+	if err != nil {
+		return safariCookieEntry{}, err
+	}
+	name, err := readStr(nameOff)
+	if err != nil {
+		return safariCookieEntry{}, err
+	}
+	cookiePath, err := readStr(pathOff)
+	if err != nil {
+		return safariCookieEntry{}, err
+	}
+	value, err := readStr(valueOff)
+	if err != nil {
+		return safariCookieEntry{}, err
+	}
+
+	var expires time.Time
+	if expFloat := math.Float64frombits(expiryBits); expFloat > 0 {
+		expires = time.Unix(int64(expFloat)+macEpochOffset, 0)
+	}
+
+	return safariCookieEntry{
+		Domain:   domain,
+		Name:     name,
+		Value:    value,
+		Path:     cookiePath,
+		Expires:  expires,
+		Secure:   flags&1 != 0,
+		HttpOnly: flags&4 != 0,
+	}, nil
 }
