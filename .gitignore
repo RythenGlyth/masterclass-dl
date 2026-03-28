@@ -1,3 +1,32 @@
-out
-go.summasterclass-dl
+# Binaries for programs and plugins
+*.exe
+masterclass-dl
 masterclass-dl.exe
+
+# Test binary, built with `go test -c`
+*.test
+
+# Runs a roomful of tests but just a level of depth, e.g. for human consumption
+.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# Temporary cache
+**/cache
+
+# Build artifacts
+build/
+dist/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
