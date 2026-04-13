@@ -462,3 +462,59 @@ type ContentItemPill struct {
 	Text string `json:"text"`
 	Kind string `json:"kind"`
 }
+
+// CampResponse represents a MasterClass "Sessions" camp from /jsonapi/v1/camps/{slug}
+type CampResponse struct {
+	ID                 int    `json:"id"`
+	Title              string `json:"title"`
+	Slug               string `json:"slug"`
+	UUID               string `json:"uuid"`
+	FullDescription    string `json:"full_description"`
+	Headline           string `json:"headline"`
+	SupportingHeadline string `json:"supporting_headline"`
+	Primary2x3         string `json:"primary_2x3"`
+	Primary16x9        string `json:"primary_16x9"`
+	CampModules        []struct {
+		ID          int    `json:"id"`
+		Title       string `json:"title"`
+		Slug        string `json:"slug"`
+		Description string `json:"description"`
+		Position    int    `json:"position"`
+		CampTasks   []struct {
+			ID          int    `json:"id"`
+			Title       string `json:"title"`
+			Slug        string `json:"slug"`
+			TaskType    string `json:"task_type"`
+			Description string `json:"description"`
+			DurationSecs int   `json:"duration_secs"`
+			Position    int    `json:"position"`
+			ThumbURL    string `json:"thumb_url"`
+			UUID        string `json:"uuid"`
+		} `json:"camp_tasks"`
+	} `json:"camp_modules"`
+	Instructors []struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	} `json:"instructors"`
+}
+
+// CampTaskDetailResponse represents the flat JSON response from /jsonapi/v1/camp-tasks/{slug}
+// with Accept: application/json, text/plain, */*
+type CampTaskDetailResponse struct {
+	ID           int    `json:"id"`
+	CampModuleID int    `json:"camp_module_id"`
+	TaskType     string `json:"task_type"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	Slug         string `json:"slug"`
+	DurationSecs int    `json:"duration_secs"`
+	UUID         string `json:"uuid"`
+	ThumbURL     string `json:"thumb_url"`
+	Video        *struct {
+		ID                int    `json:"id"`
+		BrightcoveVideoID string `json:"brightcove_video_id"`
+		MediaUUID         string `json:"media_uuid"`
+		Duration          int    `json:"duration"`
+		ThumbURL          string `json:"thumb_url"`
+	} `json:"video"`
+}

@@ -808,6 +808,7 @@ func showMetadata(client *http.Client, datDir string, jsonOutput bool, arg strin
 
 	// Parse class slug from URL
 	classSlug := arg
+	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/sessions/classes/")
 	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/classes/")
 	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/series/")
 	classSlug = strings.TrimSuffix(classSlug, "/")
@@ -836,11 +837,12 @@ func showCourseMetadata(client *http.Client, profileUUID string, jsonOutput bool
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		resp.Body.Close()
 		return fmt.Errorf("failed to get class info: status %d", resp.StatusCode)
 	}
+	defer resp.Body.Close()
 
 	// Read raw response body
 	body, err := io.ReadAll(resp.Body)
@@ -1031,6 +1033,285 @@ func showCategoryMetadata(client *http.Client, profileUUID string, jsonOutput bo
 	return nil
 }
 
+// downloadCamp handles MasterClass "Sessions" content which uses the camps API
+func downloadCamp(client *http.Client, profileUUID string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, campSlug string, taskSlug string) error {
+	fmt.Printf("Detected Sessions content, fetching camp: %s\n", campSlug)
+
+	req, err := http.NewRequest("GET", "https://www.masterclass.com/jsonapi/v1/camps/"+campSlug+"?include=camp_modules,camp_modules.camp_tasks,instructors", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Referer", "https://www.masterclass.com/sessions/classes/"+campSlug)
+	req.Header.Set("Mc-Profile-Id", profileUUID)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+
+	resp, err := doWithRetry(client, req, 3)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to get session info: status %d", resp.StatusCode)
+	}
+
+	var camp CampResponse
+	err = json.NewDecoder(resp.Body).Decode(&camp)
+	if err != nil {
+		return fmt.Errorf("failed to parse session info: %v", err)
+	}
+
+	outputDir = path.Join(outputDir, sanitizeFilename(camp.Title))
+	err = os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Output directory: %s\n", outputDir)
+
+	// Download artwork
+	if downloadPosters {
+		if camp.Primary2x3 != "" {
+			fmt.Println("Downloading poster image")
+			err = downloadImage(client, camp.Primary2x3, path.Join(outputDir, "poster.jpg"))
+			if err != nil {
+				fmt.Printf("Warning: failed to download poster: %v\n", err)
+			}
+		}
+		if camp.Primary16x9 != "" {
+			fmt.Println("Downloading fanart image")
+			err = downloadImage(client, camp.Primary16x9, path.Join(outputDir, "fanart.jpg"))
+			if err != nil {
+				fmt.Printf("Warning: failed to download fanart: %v\n", err)
+			}
+		}
+	}
+
+	// Build a flat ordered list of video tasks across all modules
+	type videoTask struct {
+		moduleTitle string
+		modulePos   int
+		task        struct {
+			ID           int
+			Title        string
+			Slug         string
+			TaskType     string
+			DurationSecs int
+			Position     int
+			ThumbURL     string
+		}
+		globalIndex int
+	}
+
+	var videoTasks []videoTask
+	globalIdx := 1
+	for _, mod := range camp.CampModules {
+		for _, t := range mod.CampTasks {
+			if t.TaskType == "video" || t.TaskType == "follow_along_video" {
+				vt := videoTask{
+					moduleTitle: mod.Title,
+					modulePos:   mod.Position,
+					globalIndex: globalIdx,
+				}
+				vt.task.ID = t.ID
+				vt.task.Title = t.Title
+				vt.task.Slug = t.Slug
+				vt.task.TaskType = t.TaskType
+				vt.task.DurationSecs = t.DurationSecs
+				vt.task.Position = t.Position
+				vt.task.ThumbURL = t.ThumbURL
+				videoTasks = append(videoTasks, vt)
+				globalIdx++
+			}
+		}
+	}
+
+	fmt.Printf("Found %d video tasks across %d modules\n", len(videoTasks), len(camp.CampModules))
+
+	if metadataOnly {
+		fmt.Println("Metadata only mode — skipping video download")
+		return nil
+	}
+
+	apiKey := "b9517f7d8d1f48c2de88100f2c13e77a9d8e524aed204651acca65202ff5c6cb9244c045795b1fafda617ac5eb0a6c50"
+
+	downloadedCount := 0
+	for _, vt := range videoTasks {
+		if taskSlug != "" && vt.task.Slug != taskSlug {
+			continue
+		}
+		fmt.Printf("Downloading task %d: %s\n", vt.globalIndex, vt.task.Title)
+		var downloaded bool
+		var err error
+		if subsOnly {
+			downloaded, err = downloadCampTaskSubsOnly(client, profileUUID, outputDir, ytdlExec, campSlug, vt.globalIndex, vt.task.Slug, vt.task.Title, apiKey)
+		} else {
+			downloaded, err = downloadCampTask(client, profileUUID, outputDir, ytdlExec, campSlug, vt.globalIndex, len(videoTasks), vt.task.Slug, vt.task.Title, apiKey, nameAsSeries, forceDownload, concurrency)
+		}
+		if err != nil {
+			fmt.Printf("Warning: task %s failed: %v\n", vt.task.Slug, err)
+			continue
+		}
+		if downloaded {
+			downloadedCount++
+		}
+	}
+
+	fmt.Printf("Downloaded %d/%d videos\n", downloadedCount, len(videoTasks))
+	return nil
+}
+
+func getCampTaskMediaUUID(client *http.Client, profileUUID string, campSlug string, taskSlug string) (string, error) {
+	req, err := http.NewRequest("GET",
+		"https://www.masterclass.com/jsonapi/v1/camp-tasks/"+taskSlug+"?include=video,video.video_segments",
+		nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Referer", "https://www.masterclass.com/sessions/classes/"+campSlug+"/tasks/"+taskSlug)
+	req.Header.Set("Mc-Profile-Id", profileUUID)
+
+	resp, err := doWithRetry(client, req, 3)
+	if err != nil {
+		return "", err
+	}
+
+	var taskDetail CampTaskDetailResponse
+	err = json.NewDecoder(resp.Body).Decode(&taskDetail)
+	resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
+
+	if taskDetail.Video == nil || taskDetail.Video.MediaUUID == "" {
+		return "", nil
+	}
+	return taskDetail.Video.MediaUUID, nil
+}
+
+func downloadCampTaskSubsOnly(client *http.Client, profileUUID string, outputDir string, ytdlExec string, campSlug string, taskNum int, taskSlug string, taskTitle string, apiKey string) (bool, error) {
+	mediaUUID, err := getCampTaskMediaUUID(client, profileUUID, campSlug, taskSlug)
+	if err != nil {
+		return false, err
+	}
+	if mediaUUID == "" {
+		fmt.Printf("Skipping task %s: no media UUID found\n", taskSlug)
+		return false, nil
+	}
+
+	safeTitle := sanitizeFilename(taskTitle)
+	baseFilename := path.Join(outputDir, fmt.Sprintf("%03d-%s", taskNum, safeTitle))
+
+	streamURL, textTracks, err := getChapterStreamInfo(client, profileUUID, mediaUUID, apiKey)
+	if err != nil {
+		return false, err
+	}
+
+	for _, track := range textTracks {
+		if track.Src == "" {
+			continue
+		}
+		subFilename := fmt.Sprintf("%s.%s.vtt", baseFilename, track.SrcLang)
+		resp, err := client.Get(track.Src)
+		if err != nil {
+			fmt.Printf("  Warning: failed to download %s subtitle: %v\n", track.Label, err)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			fmt.Printf("  Warning: failed to download %s subtitle: status %d\n", track.Label, resp.StatusCode)
+			continue
+		}
+		subFile, err := os.Create(subFilename)
+		if err != nil {
+			resp.Body.Close()
+			fmt.Printf("  Warning: failed to create subtitle file for %s: %v\n", track.Label, err)
+			continue
+		}
+		_, err = io.Copy(subFile, resp.Body)
+		subFile.Close()
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("  Warning: failed to write subtitle file for %s: %v\n", track.Label, err)
+			continue
+		}
+		fmt.Printf("  Downloaded subtitle: %s (%s)\n", track.Label, track.SrcLang)
+	}
+
+	if streamURL != "" && len(textTracks) == 0 {
+		cmd := exec.Command(ytdlExec, "--skip-download", "--write-subs", "--all-subs", "-o", baseFilename+".%(ext)s", streamURL)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("  Warning: yt-dlp subtitle extraction failed: %v\n", err)
+		}
+	}
+
+	return true, nil
+}
+
+func downloadCampTask(client *http.Client, profileUUID string, outputDir string, ytdlExec string, campSlug string, taskNum int, totalTasks int, taskSlug string, taskTitle string, apiKey string, nameAsSeries bool, forceDownload bool, concurrency int) (bool, error) {
+	mediaUUID, err := getCampTaskMediaUUID(client, profileUUID, campSlug, taskSlug)
+	if err != nil {
+		return false, err
+	}
+	if mediaUUID == "" {
+		fmt.Printf("Skipping task %s: no media UUID found\n", taskSlug)
+		return false, nil
+	}
+
+	var baseFileName string
+	if nameAsSeries {
+		baseFileName = fmt.Sprintf("s01e%02d-%s", taskNum, sanitizeFilename(taskTitle))
+	} else {
+		baseFileName = fmt.Sprintf("%03d-%s", taskNum, sanitizeFilename(taskTitle))
+	}
+	outputFile := path.Join(outputDir, baseFileName+".mp4")
+
+	if !forceDownload {
+		if _, err := os.Stat(outputFile); err == nil {
+			fmt.Printf("Skipping (already exists): %s\n", baseFileName)
+			return false, nil
+		}
+	}
+
+	streamURL, textTracks, err := getChapterStreamInfo(client, profileUUID, mediaUUID, apiKey)
+	if err != nil {
+		return false, err
+	}
+	if streamURL == "" {
+		fmt.Printf("Skipping task %s: no video sources\n", taskSlug)
+		return false, nil
+	}
+
+	fmt.Printf("Downloading task %d/%d: %s\n", taskNum, totalTasks, taskTitle)
+
+	ytdlArgs := []string{
+		streamURL,
+		"-o", outputFile,
+		"--no-warnings",
+		"--embed-subs",
+		"--all-subs",
+		"--merge-output-format", "mp4",
+		"-f", "bestvideo+bestaudio/best",
+		"--concurrent-fragments", fmt.Sprintf("%d", concurrency),
+		"--add-metadata",
+	}
+	if !forceDownload {
+		ytdlArgs = append(ytdlArgs, "--no-overwrites")
+	}
+	for _, track := range textTracks {
+		if track.Src != "" {
+			ytdlArgs = append(ytdlArgs, "--sub-lang", track.SrcLang)
+		}
+	}
+
+	ytdlCmd := exec.Command(ytdlExec, ytdlArgs...)
+	ytdlCmd.Stdout = os.Stdout
+	ytdlCmd.Stderr = os.Stderr
+	if err := ytdlCmd.Run(); err != nil {
+		return false, fmt.Errorf("yt-dlp failed: %v", err)
+	}
+	return true, nil
+}
+
 func download(client *http.Client, datDir string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, arg string) error {
 	if (client.Jar.Cookies(&url.URL{Scheme: "https", Host: "www.masterclass.com"}) == nil) {
 		return fmt.Errorf("cookies not found. Please login first")
@@ -1054,9 +1335,11 @@ func download(client *http.Client, datDir string, outputDir string, downloadPdfs
 		classSlug = arg
 	}
 
-	// Strip URL prefixes for both classes and series
+	// Strip URL prefixes for both classes, sessions, and series
+	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/sessions/classes/")
 	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/classes/")
 	classSlug = strings.TrimPrefix(classSlug, "https://www.masterclass.com/series/")
+	classSlug = strings.TrimPrefix(classSlug, "sessions/classes/")
 	classSlug = strings.TrimPrefix(classSlug, "classes/")
 	classSlug = strings.TrimPrefix(classSlug, "series/")
 	classSlug = strings.TrimSuffix(classSlug, "/")
@@ -1080,10 +1363,13 @@ func download(client *http.Client, datDir string, outputDir string, downloadPdfs
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("failed to get class info")
+		resp.Body.Close()
+		// Not a course — try the Sessions (camp) API
+		return downloadCamp(client, profile.UUID, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, classSlug, chapterSlug)
 	}
+	defer resp.Body.Close()
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -1212,7 +1498,6 @@ func download(client *http.Client, datDir string, outputDir string, downloadPdfs
 	if !metadataOnly {
 		// Masterclass uses a fixed API key for media metadata requests
 		apiKey := "b9517f7d8d1f48c2de88100f2c13e77a9d8e524aed204651acca65202ff5c6cb9244c045795b1fafda617ac5eb0a6c50"
-		fmt.Printf("Using API key\n")
 
 		if chapterSlug != "" {
 			fmt.Printf("Looking for chapter slug: %s\n", chapterSlug)
