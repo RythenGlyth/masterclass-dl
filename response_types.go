@@ -518,3 +518,64 @@ type CampTaskDetailResponse struct {
 		ThumbURL          string `json:"thumb_url"`
 	} `json:"video"`
 }
+
+// HyperDocsResponse represents the JSON:API response from
+// /jsonapi/v1/hyper-docs/?filter[camp_task_id]={slug}&include=hyper_elements,hyper_elements.items
+// A "hyper-doc" is the structured content of a Sessions activity (checklists,
+// PDFs, prompts, images) that the website renders in-browser.
+//
+// The server returns this in two different shapes depending on the Accept
+// header (and possibly the proxy in front): a JSON:API envelope, or a flat
+// denormalized array. The downloader reads bytes and normalizes either shape
+// into this struct via parseHyperDocs.
+type HyperDocsResponse struct {
+	Data     []HyperDoc     `json:"data"`
+	Included []HyperElement `json:"included"`
+}
+
+type HyperDoc struct {
+	ID            string                `json:"id"`
+	Type          string                `json:"type"`
+	Attributes    HyperDocAttributes    `json:"attributes"`
+	Relationships HyperDocRelationships `json:"relationships"`
+}
+
+type HyperDocAttributes struct {
+	DocType  string `json:"doc_type"`
+	Position int    `json:"position"`
+}
+
+type HyperDocRelationships struct {
+	HyperElements struct {
+		Data []HyperRef `json:"data"`
+	} `json:"hyper_elements"`
+}
+
+type HyperRef struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+type HyperElement struct {
+	ID            string                    `json:"id"`
+	Type          string                    `json:"type"`
+	Attributes    HyperElementAttributes    `json:"attributes"`
+	Relationships HyperElementRelationships `json:"relationships"`
+}
+
+type HyperElementAttributes struct {
+	ElementType  string  `json:"element_type"`
+	Text         string  `json:"text"`
+	Subtext      *string `json:"subtext"`
+	VisibleIndex *string `json:"visible_index"`
+	Position     int     `json:"position"`
+	HyperDocID   int     `json:"hyper_doc_id"`
+	ImageURL     *string `json:"image_url"`
+	Link         *string `json:"link"`
+}
+
+type HyperElementRelationships struct {
+	Items struct {
+		Data []HyperRef `json:"data"`
+	} `json:"items"`
+}

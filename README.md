@@ -6,11 +6,13 @@ A command line tool to download masterclass.com classes.
 
 - **Download entire categories** - Bulk download all classes from any category page
 - **Sessions support** - Download MasterClass Sessions (`/sessions/classes/{slug}`) in addition to regular classes and series
+- **Sessions activities** - Checklists, instruction guides, and other interactive lessons rendered to Markdown, with embedded PDFs and images saved alongside
+- **Organized output** - Sessions camps split into per-module folders, each activity in its own subfolder; auto-migrates an existing flat layout without re-downloading
 - **Plex-ready output** - Poster (`poster.jpg`) and fanart (`fanart.jpg`) images for media servers
 - **Embedded subtitles** - 10+ languages automatically embedded in videos
 - **Subtitles-only mode** - Download just subtitles without video files
 - **PDF workbooks** - Class guides and supplementary materials
-- **Flexible options** - Control what gets downloaded with `--pdfs`, `--posters`, `--limit`
+- **Flexible options** - Control what gets downloaded with `--pdfs`, `--posters`, `--limit`, `--organize`
 - **SSO support** - Login via Safari session for Google/Apple/company SSO accounts (macOS)
 
 ## Prerequisites
@@ -91,8 +93,9 @@ masterclass-dl download -o ./downloads --limit 0 "https://www.masterclass.com/ho
 |------|-------|---------|-------------|
 | `--output` | `-o` | (required) | Output directory |
 | `--limit` | `-l` | 10 | Max classes to download from a category (0 = unlimited) |
-| `--pdfs` | `-p` | true | Download PDF workbooks |
+| `--pdfs` | `-p` | true | Download PDF workbooks; for Sessions camps also renders activity content (Markdown + embedded PDFs/images) |
 | `--posters` | | true | Download poster and fanart images |
+| `--organize` | | true | For Sessions camps, place each module's videos and activities in their own subfolder. Re-running on an old flat layout will migrate existing files into the new structure without re-downloading. |
 | `--ytdl-exec` | `-y` | yt-dlp | Path to yt-dlp/youtube-dl executable |
 | `--name-files-as-series` | | false | Name files in TV series format for Plex/Jellyfin |
 | `--write-nfo` | | false | Generate NFO metadata files alongside downloads |
@@ -165,6 +168,37 @@ downloads/
 - `episode_id` - s01e01 format
 - `network` - "MasterClass"
 - `synopsis` - Course overview
+
+### Sessions camps (with `--organize`, default)
+
+Sessions classes (`/sessions/classes/{slug}`) are split into per-module subfolders, and each interactive activity (checklists, instruction guides, prompt-based lessons) gets its own subfolder containing the rendered Markdown alongside any PDFs and images it references:
+
+```
+downloads/
+└── Capture Your Vision Through Photography/
+    ├── poster.jpg
+    ├── fanart.jpg
+    ├── 01 - Gearing Up for Inspiration/
+    │   ├── 01 - Petra Collins Class Trailer.mp4
+    │   ├── 02 - Meet Your Instructor.mp4
+    │   ├── 03 - Sessions Overview.mp4
+    │   ├── Activity - Complete Petra's Essential Checklist/
+    │   │   ├── Complete Petra's Essential Checklist.md
+    │   │   ├── The Petra Collins Starter Kit.pdf
+    │   │   ├── img-1874.jpg
+    │   │   └── ...
+    │   └── Activity - Learn to Properly Load Film Into Your Camera/
+    │       ├── Learn to Properly Load Film Into Your Camera.md
+    │       └── Film Development Directory.pdf
+    └── 02 - Understand Your Camera and Lighting Techniques/
+        └── ...
+```
+
+The activity Markdown preserves checklists, numbered instructions, and links exactly as they appear in the MasterClass UI; you can open it in any Markdown reader (Obsidian recommended for clickable checkboxes).
+
+With `--name-files-as-series`, the module position is mapped to the season number (`s01e01`, `s02e01`, …) so each module shows up as its own season in Plex/Jellyfin.
+
+If you previously downloaded a Sessions camp with the old flat layout, just re-run the same `download` command — existing files are migrated into the new structure with no re-download.
 
 ## Global Flags
 
