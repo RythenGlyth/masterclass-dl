@@ -30,3 +30,9 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# HAR files — may contain real session cookies and PII
+*.har
+
+# Local agent / tooling caches
+.claude/

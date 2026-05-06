@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,6 +29,16 @@ import (
 // On Windows: < > : " / \ | ? *
 // Also handles characters that are problematic across platforms.
 func sanitizeFilename(name string) string {
+	// Drop ASCII control characters (NUL through 0x1F) that some upstream
+	// titles contain — e.g. trailing "\n" on certain MasterClass camp_task
+	// titles. These crash filesystem APIs on Windows.
+	cleaned := strings.Map(func(r rune) rune {
+		if r < 0x20 {
+			return -1
+		}
+		return r
+	}, name)
+
 	// Characters to replace (illegal on Windows, problematic elsewhere)
 	replacer := strings.NewReplacer(
 		"?", "#",
@@ -40,7 +51,10 @@ func sanitizeFilename(name string) string {
 		"|", "-",
 		"*", "",
 	)
-	result := replacer.Replace(name)
+	result := replacer.Replace(cleaned)
+
+	// Collapse runs of whitespace introduced by the control-char strip.
+	result = strings.Join(strings.Fields(result), " ")
 
 	// On Windows, also handle trailing dots and spaces which are problematic
 	if runtime.GOOS == "windows" {
@@ -92,6 +106,7 @@ func main() {
 	var forceDownload bool
 	var concurrency int
 	var subsOnly bool
+	var organize bool
 	var downloadCmd = &cobra.Command{
 		Use:     "download [class/chapter/category...]",
 		Aliases: []string{"dl"},
@@ -129,12 +144,12 @@ Supported URL formats:
 			for _, arg := range args {
 				// Check if this is a category/homepage URL
 				if strings.Contains(arg, "/homepage/") {
-					err := downloadCategory(getClient(datDir), datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, limit, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, arg)
+					err := downloadCategory(getClient(datDir), datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, limit, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, organize, arg)
 					if err != nil {
 						fmt.Println(err)
 					}
 				} else {
-					err := download(getClient(datDir), datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, arg)
+					err := download(getClient(datDir), datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, organize, arg)
 					if err != nil {
 						fmt.Println(err)
 					}
@@ -143,7 +158,7 @@ Supported URL formats:
 		},
 	}
 	downloadCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory")
-	downloadCmd.Flags().BoolVarP(&downloadPdfs, "pdfs", "p", true, "Download PDFs")
+	downloadCmd.Flags().BoolVarP(&downloadPdfs, "pdfs", "p", true, "Download PDFs and, for Sessions camps, activity content (rendered as Markdown alongside any embedded PDFs/images)")
 	downloadCmd.Flags().BoolVar(&downloadPosters, "posters", true, "Download poster and fanart images")
 	downloadCmd.Flags().StringVarP(&ytdlExec, "ytdl-exec", "y", "yt-dlp", "Path to the youtube-dl or yt-dlp executable")
 	downloadCmd.Flags().IntVarP(&limit, "limit", "l", 10, "Maximum number of classes to download from a category (0 for unlimited)")
@@ -153,6 +168,7 @@ Supported URL formats:
 	downloadCmd.Flags().BoolVar(&forceDownload, "force", false, "Re-download files even if they already exist")
 	downloadCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 1, "Number of concurrent fragment downloads for yt-dlp")
 	downloadCmd.Flags().BoolVarP(&subsOnly, "subs-only", "s", false, "Download only subtitles (no video)")
+	downloadCmd.Flags().BoolVar(&organize, "organize", true, "For Sessions camps, place each module's videos and activities in their own subfolder. Re-running on an old flat layout will move existing files into the new structure without re-downloading.")
 	downloadCmd.MarkFlagRequired("output")
 
 	var loginCmd = &cobra.Command{
@@ -1034,7 +1050,7 @@ func showCategoryMetadata(client *http.Client, profileUUID string, jsonOutput bo
 }
 
 // downloadCamp handles MasterClass "Sessions" content which uses the camps API
-func downloadCamp(client *http.Client, profileUUID string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, campSlug string, taskSlug string) error {
+func downloadCamp(client *http.Client, profileUUID string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, organize bool, campSlug string, taskSlug string) error {
 	fmt.Printf("Detected Sessions content, fetching camp: %s\n", campSlug)
 
 	req, err := http.NewRequest("GET", "https://www.masterclass.com/jsonapi/v1/camps/"+campSlug+"?include=camp_modules,camp_modules.camp_tasks,instructors", nil)
@@ -1085,46 +1101,53 @@ func downloadCamp(client *http.Client, profileUUID string, outputDir string, dow
 		}
 	}
 
-	// Build a flat ordered list of video tasks across all modules
-	type videoTask struct {
-		moduleTitle string
-		modulePos   int
-		task        struct {
-			ID           int
-			Title        string
-			Slug         string
-			TaskType     string
-			DurationSecs int
-			Position     int
-			ThumbURL     string
+	// Build a flat ordered list of all tasks (videos + activities) with full
+	// module context. We iterate this once for videos and once for activities.
+	moduleFolder := func(modPos int, modTitle string) string {
+		if !organize {
+			return outputDir
 		}
-		globalIndex int
+		return path.Join(outputDir, fmt.Sprintf("%02d - %s", modPos, sanitizeFilename(modTitle)))
 	}
 
-	var videoTasks []videoTask
+	var plan []plannedTask
+	var videoCount int
 	globalIdx := 1
 	for _, mod := range camp.CampModules {
+		mf := moduleFolder(mod.Position, mod.Title)
 		for _, t := range mod.CampTasks {
-			if t.TaskType == "video" || t.TaskType == "follow_along_video" {
-				vt := videoTask{
-					moduleTitle: mod.Title,
-					modulePos:   mod.Position,
-					globalIndex: globalIdx,
-				}
-				vt.task.ID = t.ID
-				vt.task.Title = t.Title
-				vt.task.Slug = t.Slug
-				vt.task.TaskType = t.TaskType
-				vt.task.DurationSecs = t.DurationSecs
-				vt.task.Position = t.Position
-				vt.task.ThumbURL = t.ThumbURL
-				videoTasks = append(videoTasks, vt)
-				globalIdx++
+			isVideo := t.TaskType == "video" || t.TaskType == "follow_along_video"
+			pt := plannedTask{
+				modPos:    mod.Position,
+				modTitle:  mod.Title,
+				modFolder: mf,
+				taskPos:   t.Position,
+				taskTitle: t.Title,
+				taskSlug:  t.Slug,
+				taskDescr: t.Description,
+				isVideo:   isVideo,
 			}
+			if isVideo {
+				pt.globalIdx = globalIdx
+				globalIdx++
+				videoCount++
+			}
+			pt.baseFileName = computeVideoBaseFileName(pt.modPos, pt.taskPos, pt.globalIdx, pt.taskTitle, organize, nameAsSeries)
+			plan = append(plan, pt)
 		}
 	}
 
-	fmt.Printf("Found %d video tasks across %d modules\n", len(videoTasks), len(camp.CampModules))
+	fmt.Printf("Found %d video tasks across %d modules\n", videoCount, len(camp.CampModules))
+
+	// Migrate any legacy flat-layout files into the new per-module subfolders.
+	// This lets users who previously downloaded with the old flat layout pick
+	// up the new structure on next run without re-downloading.
+	if organize {
+		migrateCampFlatFiles(outputDir, plan, nameAsSeries)
+		for _, mod := range camp.CampModules {
+			os.MkdirAll(moduleFolder(mod.Position, mod.Title), 0755)
+		}
+	}
 
 	if metadataOnly {
 		fmt.Println("Metadata only mode — skipping video download")
@@ -1134,20 +1157,22 @@ func downloadCamp(client *http.Client, profileUUID string, outputDir string, dow
 	apiKey := "b9517f7d8d1f48c2de88100f2c13e77a9d8e524aed204651acca65202ff5c6cb9244c045795b1fafda617ac5eb0a6c50"
 
 	downloadedCount := 0
-	for _, vt := range videoTasks {
-		if taskSlug != "" && vt.task.Slug != taskSlug {
+	for _, pt := range plan {
+		if !pt.isVideo {
 			continue
 		}
-		fmt.Printf("Downloading task %d: %s\n", vt.globalIndex, vt.task.Title)
+		if taskSlug != "" && pt.taskSlug != taskSlug {
+			continue
+		}
 		var downloaded bool
 		var err error
 		if subsOnly {
-			downloaded, err = downloadCampTaskSubsOnly(client, profileUUID, outputDir, ytdlExec, campSlug, vt.globalIndex, vt.task.Slug, vt.task.Title, apiKey)
+			downloaded, err = downloadCampTaskSubsOnly(client, profileUUID, pt.modFolder, pt.baseFileName, ytdlExec, campSlug, pt.taskSlug, apiKey)
 		} else {
-			downloaded, err = downloadCampTask(client, profileUUID, outputDir, ytdlExec, campSlug, vt.globalIndex, len(videoTasks), vt.task.Slug, vt.task.Title, apiKey, nameAsSeries, forceDownload, concurrency)
+			downloaded, err = downloadCampTask(client, profileUUID, pt.modFolder, pt.baseFileName, ytdlExec, campSlug, pt.globalIdx, videoCount, pt.taskSlug, pt.taskTitle, apiKey, forceDownload, concurrency)
 		}
 		if err != nil {
-			fmt.Printf("Warning: task %s failed: %v\n", vt.task.Slug, err)
+			fmt.Printf("Warning: task %s failed: %v\n", pt.taskSlug, err)
 			continue
 		}
 		if downloaded {
@@ -1155,8 +1180,652 @@ func downloadCamp(client *http.Client, profileUUID string, outputDir string, dow
 		}
 	}
 
-	fmt.Printf("Downloaded %d/%d videos\n", downloadedCount, len(videoTasks))
+	fmt.Printf("Downloaded %d/%d videos\n", downloadedCount, videoCount)
+
+	// Download activity content (hyper-docs) for every task — videos can have
+	// supplementary materials too, and non-video tasks (checklists, prompts,
+	// reflection exercises) only exist as hyper-docs.
+	if downloadPdfs {
+		fmt.Println("Downloading activities and supplementary materials")
+		activityCount := 0
+		for _, pt := range plan {
+			if taskSlug != "" && pt.taskSlug != taskSlug {
+				continue
+			}
+			wrote, err := downloadCampTaskActivity(client, profileUUID, pt.modFolder, outputDir, campSlug, pt.modPos, pt.taskPos, pt.taskSlug, pt.taskTitle, pt.taskDescr, organize, forceDownload)
+			if err != nil {
+				fmt.Printf("  Warning: activity %s failed: %v\n", pt.taskSlug, err)
+				continue
+			}
+			if wrote {
+				activityCount++
+			}
+		}
+		fmt.Printf("Saved %d activity document(s)\n", activityCount)
+	}
+
 	return nil
+}
+
+// plannedTask is a flat representation of a single Sessions camp_task with
+// full module context. The downloader builds one of these per task and uses
+// it for both the video pass and the activities pass.
+type plannedTask struct {
+	modPos       int
+	modTitle     string
+	modFolder    string // either outputDir (flat) or per-module subfolder
+	taskPos      int
+	taskTitle    string
+	taskSlug     string
+	taskDescr    string
+	isVideo      bool
+	globalIdx    int // 1-based across ALL video tasks (legacy flat naming + display)
+	baseFileName string
+}
+
+// computeVideoBaseFileName picks the right naming scheme for a Sessions video
+// based on layout flags. With organize+nameAsSeries we map module→season,
+// task position→episode (Plex-friendly across modules); without organize we
+// keep the legacy global-index naming so existing libraries don't break.
+func computeVideoBaseFileName(modulePos, taskPos, globalIdx int, taskTitle string, organize, nameAsSeries bool) string {
+	safe := sanitizeFilename(taskTitle)
+	if organize {
+		if nameAsSeries {
+			return fmt.Sprintf("s%02de%02d-%s", modulePos, taskPos, safe)
+		}
+		return fmt.Sprintf("%02d - %s", taskPos, safe)
+	}
+	if nameAsSeries {
+		return fmt.Sprintf("s01e%02d-%s", globalIdx, safe)
+	}
+	return fmt.Sprintf("%03d-%s", globalIdx, safe)
+}
+
+// migrateCampFlatFiles relocates any files left over from older layouts into
+// the current per-module / per-activity structure. It is safe to re-run; an
+// existing destination is never overwritten. Three prior layouts are handled:
+//
+//   - Old flat (camp root): videos as "{globalIdx:03d}-{title}.*" or
+//     "s01e{globalIdx:02d}-{title}.*"; activity files as
+//     "Activity {modPos:02d}-{taskPos:02d} - {title}*"
+//   - Per-module flat: activities as "Activity - {title}*" sitting next to
+//     videos in the module folder (an in-between version)
+//   - Current per-activity subfolders: nothing to do
+//
+// When a markdown file is moved into a per-activity subfolder, its image and
+// PDF references are rewritten to use the new short basenames.
+func migrateCampFlatFiles(outputDir string, plan []plannedTask, nameAsSeries bool) {
+	migrated := 0
+	for _, pt := range plan {
+		safe := sanitizeFilename(pt.taskTitle)
+
+		if pt.isVideo {
+			oldPrefixes := []string{
+				fmt.Sprintf("%03d-%s", pt.globalIdx, safe),
+				fmt.Sprintf("s01e%02d-%s", pt.globalIdx, safe),
+			}
+			for _, oldPrefix := range oldPrefixes {
+				migrated += renamePrefix(outputDir, oldPrefix, pt.modFolder, pt.baseFileName)
+			}
+		}
+
+		// Activities → per-activity subfolder. We try every possible source
+		// prefix in turn; whichever ones match get moved into the right place.
+		activityDir := path.Join(pt.modFolder, "Activity - "+safe)
+		oldRoots := []struct {
+			dir, prefix string
+		}{
+			{outputDir, fmt.Sprintf("Activity %02d-%02d - %s", pt.modPos, pt.taskPos, safe)},
+			{pt.modFolder, "Activity - " + safe},
+		}
+		for _, src := range oldRoots {
+			migrated += migrateActivityFiles(src.dir, src.prefix, activityDir, safe)
+		}
+	}
+	if migrated > 0 {
+		fmt.Printf("Reorganized %d existing file(s) into module subfolders\n", migrated)
+	}
+}
+
+// migrateActivityFiles moves files matching "{prefix}.{ext}" or
+// "{prefix} - {sub}.{ext}" out of srcDir and into dstDir, renaming as:
+//
+//	{prefix}.{ext}        → {newBase}.{ext}
+//	{prefix} - {sub}.{ext} → {sub}.{ext}
+//
+// If a markdown file is moved, its content is patched so internal references
+// to "{prefix} - " (image and PDF basenames in the old layout) are stripped.
+// Returns the number of files moved.
+func migrateActivityFiles(srcDir, prefix, dstDir, newBase string) int {
+	if path.Clean(srcDir) == path.Clean(dstDir) {
+		return 0
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return 0
+	}
+	moved := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := name[len(prefix):]
+		var newName string
+		switch {
+		case rest == "":
+			continue
+		case rest[0] == '.':
+			newName = newBase + rest
+		case strings.HasPrefix(rest, " - "):
+			newName = rest[3:]
+		default:
+			continue
+		}
+		oldPath := path.Join(srcDir, name)
+		newPath := path.Join(dstDir, newName)
+		if _, err := os.Stat(newPath); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(dstDir, 0755); err != nil {
+			continue
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			fmt.Printf("  Warning: could not move %s: %v\n", name, err)
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(newName), ".md") {
+			rewriteMarkdownRefs(newPath, prefix+" - ")
+		}
+		moved++
+	}
+	return moved
+}
+
+// rewriteMarkdownRefs strips an obsolete prefix (e.g. "Activity 01-04 - X - ")
+// out of a Markdown file's content so image and PDF references become bare
+// basenames matching their new location alongside the file.
+func rewriteMarkdownRefs(mdPath, oldRefPrefix string) {
+	data, err := os.ReadFile(mdPath)
+	if err != nil {
+		return
+	}
+	if !bytes.Contains(data, []byte(oldRefPrefix)) {
+		return
+	}
+	out := bytes.ReplaceAll(data, []byte(oldRefPrefix), nil)
+	_ = os.WriteFile(mdPath, out, 0644)
+}
+
+// renamePrefix scans srcDir for files whose name starts with oldPrefix
+// (followed by '.', ' ', or '-' so longer prefixes don't false-match) and
+// renames each into dstDir with oldPrefix replaced by newPrefix. Returns the
+// number of files actually moved. Existing destinations are skipped.
+func renamePrefix(srcDir, oldPrefix, dstDir, newPrefix string) int {
+	if srcDir == dstDir && oldPrefix == newPrefix {
+		return 0
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return 0
+	}
+	moved := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, oldPrefix) {
+			continue
+		}
+		rest := name[len(oldPrefix):]
+		if rest != "" && rest[0] != '.' && rest[0] != ' ' && rest[0] != '-' {
+			continue
+		}
+		oldPath := path.Join(srcDir, name)
+		newName := newPrefix + rest
+		newPath := path.Join(dstDir, newName)
+		if oldPath == newPath {
+			continue
+		}
+		if _, err := os.Stat(newPath); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(dstDir, 0755); err != nil {
+			continue
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			fmt.Printf("  Warning: could not move %s: %v\n", name, err)
+			continue
+		}
+		moved++
+	}
+	return moved
+}
+
+// downloadCampTaskActivity fetches the hyper-docs for a Sessions camp_task and
+// writes them as a single Markdown file. Any pdf_link elements are downloaded
+// as actual .pdf files alongside, and referenced images are saved locally so
+// the markdown is fully offline.
+func downloadCampTaskActivity(client *http.Client, profileUUID string, outputDir string, campRoot string, campSlug string, modulePos int, taskPos int, taskSlug string, taskTitle string, taskDescription string, organize bool, forceDownload bool) (bool, error) {
+	apiURL := fmt.Sprintf("https://www.masterclass.com/jsonapi/v1/hyper-docs/?filter[camp_task_id]=%s&include=hyper_elements,hyper_elements.items", taskSlug)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Referer", "https://www.masterclass.com/sessions/classes/"+campSlug+"/tasks/"+taskSlug)
+	req.Header.Set("Mc-Profile-Id", profileUUID)
+
+	resp, err := doWithRetry(client, req, 3)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false, fmt.Errorf("hyper-docs returned status %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+
+	// Server returns one of two shapes depending on Accept header / proxy:
+	// (a) JSON:API envelope: {"data":[...], "included":[...]}
+	// (b) Flat array (after server-side denormalization): [{"id":..., "hyper_elements":[...]}]
+	hd, err := parseHyperDocs(bodyBytes)
+	if err != nil {
+		return false, err
+	}
+	if len(hd.Data) == 0 {
+		return false, nil
+	}
+
+	// Index elements by ID for relationship traversal.
+	byID := make(map[string]*HyperElement, len(hd.Included))
+	for i := range hd.Included {
+		byID[hd.Included[i].ID] = &hd.Included[i]
+	}
+
+	// Sort hyper-docs by position (primary_materials first, then additional).
+	sort.SliceStable(hd.Data, func(i, j int) bool {
+		return hd.Data[i].Attributes.Position < hd.Data[j].Attributes.Position
+	})
+
+	safeTitle := sanitizeFilename(taskTitle)
+	// Two layouts:
+	//   organize=true:  outputDir is the module folder. We create a per-activity
+	//                   subfolder "Activity - <title>/" and put the markdown
+	//                   ("<title>.md") and any PDFs/images inside it with simple
+	//                   names. Markdown image/PDF refs are relative basenames.
+	//   organize=false: legacy flat layout — files live directly in outputDir
+	//                   with a long disambiguating prefix.
+	var (
+		writeDir   string // where the .md file and resources go
+		mdFileName string // filename of the markdown
+		filePrefix string // prefix applied to PDFs/images (empty in organized mode)
+	)
+	if organize {
+		writeDir = path.Join(outputDir, "Activity - "+safeTitle)
+		mdFileName = safeTitle + ".md"
+		filePrefix = ""
+	} else {
+		writeDir = outputDir
+		legacy := fmt.Sprintf("Activity %02d-%02d - %s", modulePos, taskPos, safeTitle)
+		mdFileName = legacy + ".md"
+		filePrefix = legacy
+	}
+	mdPath := path.Join(writeDir, mdFileName)
+	if !forceDownload {
+		if _, err := os.Stat(mdPath); err == nil {
+			fmt.Printf("  Skipping activity (exists): %s\n", taskTitle)
+			return false, nil
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n\n", strings.TrimSpace(taskTitle))
+	if d := strings.TrimSpace(taskDescription); d != "" {
+		fmt.Fprintf(&b, "%s\n\n", d)
+	}
+
+	for _, doc := range hd.Data {
+		switch doc.Attributes.DocType {
+		case "primary_materials", "primary_instructions":
+			// no extra heading — main content
+		case "additional":
+			b.WriteString("## Additional Materials\n\n")
+		default:
+			fmt.Fprintf(&b, "## %s\n\n", titleCase(strings.ReplaceAll(doc.Attributes.DocType, "_", " ")))
+		}
+		topIDs := make([]string, 0, len(doc.Relationships.HyperElements.Data))
+		for _, ref := range doc.Relationships.HyperElements.Data {
+			topIDs = append(topIDs, ref.ID)
+		}
+		sortByPosition(topIDs, byID)
+		for _, id := range topIDs {
+			el := byID[id]
+			if el == nil {
+				continue
+			}
+			renderHyperElement(client, &b, el, byID, writeDir, filePrefix, profileUUID, campSlug, taskSlug, 0)
+		}
+	}
+
+	if err := os.MkdirAll(writeDir, 0755); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(mdPath, []byte(b.String()), 0644); err != nil {
+		return false, err
+	}
+	if organize {
+		fmt.Printf("  Wrote activity: Activity - %s/%s\n", safeTitle, mdFileName)
+	} else {
+		fmt.Printf("  Wrote activity: %s\n", path.Base(mdPath))
+	}
+	return true, nil
+}
+
+// renderHyperElement appends a Markdown rendering of a single hyper_element
+// (and any nested children) to b. Recurses through the items relationship.
+func renderHyperElement(client *http.Client, b *strings.Builder, el *HyperElement, byID map[string]*HyperElement, outputDir, prefix, profileUUID, campSlug, taskSlug string, depth int) {
+	a := el.Attributes
+	indent := strings.Repeat("  ", depth)
+	text := strings.TrimSpace(a.Text)
+
+	switch a.ElementType {
+	case "checklist_group", "section", "section_header", "header":
+		if text != "" {
+			fmt.Fprintf(b, "\n%s## %s\n\n", indent, text)
+		}
+	case "checklist_item", "list_item", "bullet":
+		fmt.Fprintf(b, "%s- [ ] %s\n", indent, text)
+		if a.Subtext != nil && strings.TrimSpace(*a.Subtext) != "" {
+			fmt.Fprintf(b, "%s  %s\n", indent, strings.TrimSpace(*a.Subtext))
+		}
+		if a.Link != nil && *a.Link != "" {
+			fmt.Fprintf(b, "%s  Link: %s\n", indent, *a.Link)
+		}
+		if a.ImageURL != nil && *a.ImageURL != "" {
+			localPath := saveHyperImage(client, *a.ImageURL, outputDir, prefix, el.ID, profileUUID, campSlug, taskSlug)
+			if localPath != "" {
+				fmt.Fprintf(b, "%s  ![](%s)\n", indent, localPath)
+			}
+		}
+	case "numbered_instruction", "numbered_item", "ordered_item":
+		num := ""
+		if a.VisibleIndex != nil {
+			num = strings.TrimSpace(*a.VisibleIndex)
+		}
+		if num == "" {
+			num = fmt.Sprintf("%d", a.Position)
+		}
+		fmt.Fprintf(b, "%s%s. %s\n", indent, num, text)
+		if a.Subtext != nil && strings.TrimSpace(*a.Subtext) != "" {
+			fmt.Fprintf(b, "%s   %s\n", indent, strings.TrimSpace(*a.Subtext))
+		}
+		if a.Link != nil && *a.Link != "" {
+			fmt.Fprintf(b, "%s   Link: %s\n", indent, *a.Link)
+		}
+		if a.ImageURL != nil && *a.ImageURL != "" {
+			localPath := saveHyperImage(client, *a.ImageURL, outputDir, prefix, el.ID, profileUUID, campSlug, taskSlug)
+			if localPath != "" {
+				fmt.Fprintf(b, "%s   ![](%s)\n", indent, localPath)
+			}
+		}
+	case "pdf_link":
+		title := text
+		if title == "" {
+			title = "Document"
+		}
+		if a.Link != nil && *a.Link != "" {
+			var pdfFilename string
+			if prefix == "" {
+				pdfFilename = sanitizeFilename(title) + ".pdf"
+			} else {
+				pdfFilename = fmt.Sprintf("%s - %s.pdf", prefix, sanitizeFilename(title))
+			}
+			pdfPath := path.Join(outputDir, pdfFilename)
+			if err := os.MkdirAll(outputDir, 0755); err != nil {
+				fmt.Printf("  Warning: could not create %s: %v\n", outputDir, err)
+			}
+			if err := downloadFile(client, *a.Link, pdfPath, profileUUID, campSlug, taskSlug); err != nil {
+				fmt.Printf("  Warning: failed to download PDF %q: %v\n", title, err)
+				fmt.Fprintf(b, "%s- 📄 [%s](%s) (download failed)\n", indent, title, *a.Link)
+			} else {
+				fmt.Printf("  Downloaded PDF: %s\n", pdfFilename)
+				fmt.Fprintf(b, "%s- 📄 [%s](%s)\n", indent, title, pdfFilename)
+			}
+		} else {
+			fmt.Fprintf(b, "%s- 📄 %s\n", indent, title)
+		}
+	case "text", "paragraph", "body":
+		if text != "" {
+			fmt.Fprintf(b, "\n%s%s\n\n", indent, text)
+		}
+	case "image":
+		if a.ImageURL != nil && *a.ImageURL != "" {
+			localPath := saveHyperImage(client, *a.ImageURL, outputDir, prefix, el.ID, profileUUID, campSlug, taskSlug)
+			if localPath != "" {
+				fmt.Fprintf(b, "\n%s![%s](%s)\n\n", indent, text, localPath)
+			}
+		}
+	default:
+		// Unknown element type — render generically so nothing is lost.
+		if text != "" {
+			fmt.Fprintf(b, "%s- (%s) %s\n", indent, a.ElementType, text)
+		}
+		if a.Link != nil && *a.Link != "" {
+			fmt.Fprintf(b, "%s  Link: %s\n", indent, *a.Link)
+		}
+	}
+
+	childIDs := make([]string, 0, len(el.Relationships.Items.Data))
+	for _, ref := range el.Relationships.Items.Data {
+		childIDs = append(childIDs, ref.ID)
+	}
+	sortByPosition(childIDs, byID)
+	for _, id := range childIDs {
+		child := byID[id]
+		if child == nil {
+			continue
+		}
+		renderHyperElement(client, b, child, byID, outputDir, prefix, profileUUID, campSlug, taskSlug, depth+1)
+	}
+}
+
+// parseHyperDocs accepts the body of /jsonapi/v1/hyper-docs/?filter[...] in
+// either of the two shapes the server returns and produces a unified
+// HyperDocsResponse that the renderer expects (JSON:API envelope shape).
+//
+// Shape A (JSON:API):  {"data":[{...,"attributes":{...},"relationships":{...}}], "included":[...]}
+// Shape B (flat):      [{"id":243, "doc_type":"...", "hyper_elements":[{"id":..., "items":[...]}]}]
+func parseHyperDocs(body []byte) (HyperDocsResponse, error) {
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	if len(trimmed) == 0 {
+		return HyperDocsResponse{}, nil
+	}
+	if trimmed[0] == '{' {
+		var hd HyperDocsResponse
+		if err := json.Unmarshal(body, &hd); err != nil {
+			return HyperDocsResponse{}, fmt.Errorf("decode envelope: %w", err)
+		}
+		return hd, nil
+	}
+
+	type flatElem struct {
+		ID           idOrInt    `json:"id"`
+		ElementType  string     `json:"element_type"`
+		Text         string     `json:"text"`
+		Subtext      *string    `json:"subtext"`
+		VisibleIndex *string    `json:"visible_index"`
+		Position     int        `json:"position"`
+		HyperDocID   int        `json:"hyper_doc_id"`
+		ImageURL     *string    `json:"image_url"`
+		Link         *string    `json:"link"`
+		Items        []flatElem `json:"items"`
+	}
+	type flatDoc struct {
+		ID            idOrInt    `json:"id"`
+		DocType       string     `json:"doc_type"`
+		Position      int        `json:"position"`
+		HyperElements []flatElem `json:"hyper_elements"`
+	}
+
+	var flat []flatDoc
+	if err := json.Unmarshal(body, &flat); err != nil {
+		return HyperDocsResponse{}, fmt.Errorf("decode flat: %w", err)
+	}
+
+	var hd HyperDocsResponse
+	var collect func(fe flatElem) HyperElement
+	collect = func(fe flatElem) HyperElement {
+		he := HyperElement{
+			ID:   string(fe.ID),
+			Type: "hyper_element",
+			Attributes: HyperElementAttributes{
+				ElementType:  fe.ElementType,
+				Text:         fe.Text,
+				Subtext:      fe.Subtext,
+				VisibleIndex: fe.VisibleIndex,
+				Position:     fe.Position,
+				HyperDocID:   fe.HyperDocID,
+				ImageURL:     fe.ImageURL,
+				Link:         fe.Link,
+			},
+		}
+		for _, child := range fe.Items {
+			childHE := collect(child)
+			he.Relationships.Items.Data = append(he.Relationships.Items.Data, HyperRef{ID: childHE.ID, Type: "hyper_element"})
+			hd.Included = append(hd.Included, childHE)
+		}
+		return he
+	}
+
+	for _, fdoc := range flat {
+		doc := HyperDoc{
+			ID:   string(fdoc.ID),
+			Type: "hyper_doc",
+			Attributes: HyperDocAttributes{
+				DocType:  fdoc.DocType,
+				Position: fdoc.Position,
+			},
+		}
+		for _, fel := range fdoc.HyperElements {
+			topHE := collect(fel)
+			doc.Relationships.HyperElements.Data = append(doc.Relationships.HyperElements.Data, HyperRef{ID: topHE.ID, Type: "hyper_element"})
+			hd.Included = append(hd.Included, topHE)
+		}
+		hd.Data = append(hd.Data, doc)
+	}
+	return hd, nil
+}
+
+// idOrInt accepts either a JSON number or a string and renders as a string.
+// MasterClass returns IDs as int in the flat shape and as string in JSON:API.
+type idOrInt string
+
+func (s *idOrInt) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	if b[0] == '"' {
+		var raw string
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return err
+		}
+		*s = idOrInt(raw)
+		return nil
+	}
+	*s = idOrInt(strings.TrimSpace(string(b)))
+	return nil
+}
+
+// titleCase capitalizes the first letter of each space-separated word. Used
+// for rendering unknown hyper-doc doc_type values as Markdown headings.
+func titleCase(s string) string {
+	parts := strings.Fields(s)
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+func sortByPosition(ids []string, byID map[string]*HyperElement) {
+	sort.SliceStable(ids, func(i, j int) bool {
+		ei, ok1 := byID[ids[i]]
+		ej, ok2 := byID[ids[j]]
+		if !ok1 || !ok2 {
+			return ids[i] < ids[j]
+		}
+		return ei.Attributes.Position < ej.Attributes.Position
+	})
+}
+
+// saveHyperImage downloads an image referenced by a hyper_element next to the
+// activity Markdown and returns the relative filename to embed. Returns "" on
+// any failure (caller will skip embedding).
+func saveHyperImage(client *http.Client, imageURL, outputDir, prefix, elementID, profileUUID, campSlug, taskSlug string) string {
+	ext := ".jpg"
+	if i := strings.LastIndex(imageURL, "."); i > 0 && len(imageURL)-i <= 5 {
+		candidate := strings.ToLower(imageURL[i:])
+		switch candidate {
+		case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+			ext = candidate
+		}
+	}
+	var filename string
+	if prefix == "" {
+		filename = fmt.Sprintf("img-%s%s", elementID, ext)
+	} else {
+		filename = fmt.Sprintf("%s - img-%s%s", prefix, elementID, ext)
+	}
+	fullPath := path.Join(outputDir, filename)
+	if _, err := os.Stat(fullPath); err == nil {
+		return filename
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return ""
+	}
+	if err := downloadFile(client, imageURL, fullPath, profileUUID, campSlug, taskSlug); err != nil {
+		return ""
+	}
+	return filename
+}
+
+// downloadFile fetches a URL with the MasterClass referer/profile headers and
+// writes the body to outputPath. Used for activity PDFs and images.
+func downloadFile(client *http.Client, fileURL, outputPath, profileUUID, campSlug, taskSlug string) error {
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Referer", "https://www.masterclass.com/sessions/classes/"+campSlug+"/tasks/"+taskSlug)
+	if profileUUID != "" {
+		req.Header.Set("Mc-Profile-Id", profileUUID)
+	}
+	resp, err := doWithRetry(client, req, 3)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
 }
 
 func getCampTaskMediaUUID(client *http.Client, profileUUID string, campSlug string, taskSlug string) (string, error) {
@@ -1192,7 +1861,7 @@ func getCampTaskMediaUUID(client *http.Client, profileUUID string, campSlug stri
 	return taskDetail.Video.MediaUUID, nil
 }
 
-func downloadCampTaskSubsOnly(client *http.Client, profileUUID string, outputDir string, ytdlExec string, campSlug string, taskNum int, taskSlug string, taskTitle string, apiKey string) (bool, error) {
+func downloadCampTaskSubsOnly(client *http.Client, profileUUID string, outputDir string, baseFileName string, ytdlExec string, campSlug string, taskSlug string, apiKey string) (bool, error) {
 	mediaUUID, err := getCampTaskMediaUUID(client, profileUUID, campSlug, taskSlug)
 	if err != nil {
 		return false, err
@@ -1202,8 +1871,7 @@ func downloadCampTaskSubsOnly(client *http.Client, profileUUID string, outputDir
 		return false, nil
 	}
 
-	safeTitle := sanitizeFilename(taskTitle)
-	baseFilename := path.Join(outputDir, fmt.Sprintf("%03d-%s", taskNum, safeTitle))
+	baseFilename := path.Join(outputDir, baseFileName)
 
 	streamURL, textTracks, err := getChapterStreamInfo(client, profileUUID, mediaUUID, apiKey)
 	if err != nil {
@@ -1251,7 +1919,7 @@ func downloadCampTaskSubsOnly(client *http.Client, profileUUID string, outputDir
 	return true, nil
 }
 
-func downloadCampTask(client *http.Client, profileUUID string, outputDir string, ytdlExec string, campSlug string, taskNum int, totalTasks int, taskSlug string, taskTitle string, apiKey string, nameAsSeries bool, forceDownload bool, concurrency int) (bool, error) {
+func downloadCampTask(client *http.Client, profileUUID string, outputDir string, baseFileName string, ytdlExec string, campSlug string, displayIdx int, totalTasks int, taskSlug string, taskTitle string, apiKey string, forceDownload bool, concurrency int) (bool, error) {
 	mediaUUID, err := getCampTaskMediaUUID(client, profileUUID, campSlug, taskSlug)
 	if err != nil {
 		return false, err
@@ -1261,12 +1929,6 @@ func downloadCampTask(client *http.Client, profileUUID string, outputDir string,
 		return false, nil
 	}
 
-	var baseFileName string
-	if nameAsSeries {
-		baseFileName = fmt.Sprintf("s01e%02d-%s", taskNum, sanitizeFilename(taskTitle))
-	} else {
-		baseFileName = fmt.Sprintf("%03d-%s", taskNum, sanitizeFilename(taskTitle))
-	}
 	outputFile := path.Join(outputDir, baseFileName+".mp4")
 
 	if !forceDownload {
@@ -1285,7 +1947,7 @@ func downloadCampTask(client *http.Client, profileUUID string, outputDir string,
 		return false, nil
 	}
 
-	fmt.Printf("Downloading task %d/%d: %s\n", taskNum, totalTasks, taskTitle)
+	fmt.Printf("Downloading task %d/%d: %s\n", displayIdx, totalTasks, taskTitle)
 
 	ytdlArgs := []string{
 		streamURL,
@@ -1316,7 +1978,7 @@ func downloadCampTask(client *http.Client, profileUUID string, outputDir string,
 	return true, nil
 }
 
-func download(client *http.Client, datDir string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, arg string) error {
+func download(client *http.Client, datDir string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, organize bool, arg string) error {
 	if (client.Jar.Cookies(&url.URL{Scheme: "https", Host: "www.masterclass.com"}) == nil) {
 		return fmt.Errorf("cookies not found. Please login first")
 	}
@@ -1371,7 +2033,7 @@ func download(client *http.Client, datDir string, outputDir string, downloadPdfs
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
 		// Not a course — try the Sessions (camp) API
-		return downloadCamp(client, profile.UUID, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, classSlug, chapterSlug)
+		return downloadCamp(client, profile.UUID, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, organize, classSlug, chapterSlug)
 	}
 	defer resp.Body.Close()
 	bodyBytes, err := io.ReadAll(resp.Body)
@@ -1595,7 +2257,7 @@ func download(client *http.Client, datDir string, outputDir string, downloadPdfs
 	return nil
 }
 
-func downloadCategory(client *http.Client, datDir string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, limit int, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, arg string) error {
+func downloadCategory(client *http.Client, datDir string, outputDir string, downloadPdfs bool, downloadPosters bool, ytdlExec string, limit int, nameAsSeries bool, writeNfo bool, metadataOnly bool, forceDownload bool, concurrency int, subsOnly bool, organize bool, arg string) error {
 	if (client.Jar.Cookies(&url.URL{Scheme: "https", Host: "www.masterclass.com"}) == nil) {
 		return fmt.Errorf("cookies not found. Please login first")
 	}
@@ -1708,7 +2370,7 @@ func downloadCategory(client *http.Client, datDir string, outputDir string, down
 		fmt.Printf("\n[%d/%d] Downloading: %s\n", i+1, downloadCount, course.Title)
 		fmt.Println(strings.Repeat("=", 60))
 
-		err := download(client, datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, course.Slug)
+		err := download(client, datDir, outputDir, downloadPdfs, downloadPosters, ytdlExec, nameAsSeries, writeNfo, metadataOnly, forceDownload, concurrency, subsOnly, organize, course.Slug)
 		if err != nil {
 			fmt.Printf("Error downloading %s: %v\n", course.Slug, err)
 			// Continue with next course instead of stopping
